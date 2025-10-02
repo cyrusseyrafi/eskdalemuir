@@ -1649,7 +1649,7 @@ print(confidence_table)
 
 # Directional Table
 
-# Round and filter to nearest available frequency for each quadrant
+# Round and filter to nearest available frequency for each quadrant.
 directional_table <- uplift_model_directional %>%
   mutate(FreqRounded = round(Frequency)) %>%
   filter(FreqRounded %in% key_freqs) %>%
