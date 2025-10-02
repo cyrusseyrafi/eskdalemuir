@@ -1,0 +1,1672 @@
+{\rtf1\ansi\ansicpg1252\cocoartf2761
+\cocoatextscaling0\cocoaplatform0{\fonttbl\f0\fswiss\fcharset0 Helvetica;}
+{\colortbl;\red255\green255\blue255;}
+{\*\expandedcolortbl;;}
+\margl1440\margr1440\vieww11520\viewh8400\viewkind0
+\pard\tx720\tx1440\tx2160\tx2880\tx3600\tx4320\tx5040\tx5760\tx6480\tx7200\tx7920\tx8640\pardirnatural\partightenfactor0
+
+\f0\fs24 \cf0 # Initialize libraries.\
+library(readxl)\
+library(psd)\
+library(ggplot2)\
+library(parallel)\
+library(dwelch)\
+library(gsignal)\
+library(dplyr)\
+library(reshape2)\
+library(mgcv)\
+library(qgam)\
+library(gratia)\
+library(xgboost)\
+library(purrr)\
+\
+# Set working directory.\
+# setwd("/Users/cyrusseyrafi/Desktop/Eskdalemuir Seismic Array")\
+# output_dir <- "/Users/cyrusseyrafi/Desktop/Eskdalemuir Seismic Array"\
+output_dir <- "output"\
+\
+# Load initial datasets.\
+background_xi_welch <- read.csv("Background_Frequency_Domain_WS12.csv")\
+background_xi_data <- read.csv("Background_Time_Series_WS12.csv")\
+operational_xi_welch <- read.csv("Operational_Frequency_Domain_WS12.csv")\
+operational_xi_data <- read.csv("Operational_Time_Series_WS12.csv")\
+EKA_weighting_table <- read_excel("FDWF_Data.xlsx")\
+\
+# Combine background and operational data.\
+xi_welch <- bind_rows(background_xi_welch, operational_xi_welch)\
+xi_data <- bind_rows(background_xi_data, operational_xi_data)\
+\
+# Remove original dataframes.\
+remove(background_xi_data)\
+remove(background_xi_welch)\
+remove(operational_xi_data)\
+remove(operational_xi_welch)\
+\
+#### PREPROCESSING\
+\
+## I begin with three data frames:\
+\
+## `xi_data` is a seismic velocity time series containing 394 ten-minute chunks.\
+## `xi_welch` is a frequency-domain dataset containing EKA-adjusted PSDs for 47 \
+##  chunks.\
+## `EKA_weighting_table` is a 2-column dataset that provides EKA-weights per \
+##  frequency bin in `xi_welch`.\
+\
+## `weight` interpolates the EKA-weighting function to all frequency values. \
+\
+weight <- splinefun(EKA_weighting_table$Frequency_Hz, \
+                    EKA_weighting_table$Frequency_Distance_Weighting_Function)\
+\
+## `welch_method` applies Welch's method (from `gsignal::pwelch`) and Astfalck's \
+## debiased Welch's method (from `dwelch::dwelch`) to generate an expanded \
+## spectral dataset for all 394 chunks present in `xi_data`.\
+\
+welch_method <- function(xi_data = xi_data, sampling_rate = 100, segments = 28, \
+                         bins = 8192, overlap = 0.5, dwelch_toggle = FALSE, \
+                         pwelch_detrend = "long-mean") \{\
+  # Aggregate time series data into 10-minute chunks.\
+  chunks <- xi_data %>%\
+    group_by(Date, Hour) %>%\
+    group_split()\
+  \
+  # Extract the number of samples per chunk (60,000).\
+  count <- length(chunks[[1]]$Seismic_Velocity..m.s.)\
+  \
+  # Determine the distance between Welch segments.\
+  step <- floor(count / (segments + 1))\
+  \
+  # Determine length of each Welch segment (for standard Welch).\
+  segment_length <- count - (segments - 1) * step\
+  \
+  # Initialize Hamming window.\
+  window <- hamming(segment_length)\
+  \
+  # Initialize window centers (for debiased Welch).\
+  basis_info <- get_centres(l = segment_length, k = floor(segment_length / 4), \
+                            delta = 1 / sampling_rate)\
+  centres <- basis_info$centres\
+  widths <- basis_info$widths\
+  \
+  # Initialize chunk ticker (for debiased Welch, since it runs slow.)\
+  ticker <- 0\
+  \
+  # Loop through each chunk in the dataset:\
+  psd_by_chunk <- lapply(chunks, function(df_chunk) \{\
+    \
+    # Extract the seismic velocities in this chunk.\
+    velocity <- df_chunk$Seismic_Velocity..m.s.\
+    \
+    # Apply standard Welch's method to estimate seismic velocity PSD.\
+    psd_pwelch <- gsignal::pwelch(\
+      x = velocity,\
+      fs = sampling_rate,\
+      window = window,\
+      overlap = overlap,\
+      nfft = bins * 2,\
+      detrend = pwelch_detrend # i.e. Remove offset from windowing.\
+    )\
+    \
+    # Initialize function to convert velocity PSD result to displacement PSDs\
+    # and apply EKA-weighting function.\
+    compute_psd_df <- function(freq, psd) \{\
+      data.frame(\
+        Frequency..Hz. = freq,\
+        PSD.Velocity..m.2.s2.Hz. = psd\
+      ) %>%\
+        dplyr::filter(Frequency..Hz. != 0) %>% # Eliminate 0 Hz values.\
+        mutate(PSD.Displacement..m.2.Hz. = \
+                 PSD.Velocity..m.2.s2.Hz. / ((2 * pi * Frequency..Hz.)^2),\
+               Frequency.Dependent.PSD.Displacement..m.2.Hz. = \
+                 weight(Frequency..Hz.) * PSD.Displacement..m.2.Hz.)\
+    \}\
+    \
+    # Initialize function to preserve chunk metadata in new dataset.\
+    add_metadata <- function(psd_df) \{\
+      psd_df %>%\
+        mutate(\
+          Date = df_chunk$Date[1],\
+          Hour = df_chunk$Hour[1],\
+          Wind.speed = df_chunk$Wind.speed[1],\
+          Rounded.Wind.speed = df_chunk$Rounded.Wind.speed[1],\
+          Wind.direction.degrees = df_chunk$Wind.direction.degrees[1],\
+          Wind.direction.radians = df_chunk$Wind.direction.radians[1],\
+          No.of.samples = df_chunk$No.of.samples[1],\
+          Operational = df_chunk$Operational[1]\
+        )\
+    \}\
+    \
+    # Apply standard Welch's method pipeline.\
+    pwelch_df <- compute_psd_df(psd_pwelch$freq, psd_pwelch$spec) %>%\
+      add_metadata()\
+    \
+    # If debiased Welch's method enabled, begin pipeline:\
+    if (dwelch_toggle) \{\
+      start_time <- Sys.time()\
+      \
+      # Apply debiased Welch's method.\
+      psd_dwelch <- dwelch(\
+        ts = velocity,\
+        m = segments,\
+        l = segment_length,\
+        s = step,\
+        k = floor(segment_length / 8),\
+        delta = 1 / sampling_rate,\
+        h = window,\
+        model = "nnls",\
+        centres = centres,\
+        widths = widths\
+      )\
+      \
+      # Report chunk generated (of 394).\
+      ticker <<- ticker + 1\
+      cat("Chunk #", ticker, ":", Sys.time() - start_time, "\\n")\
+      \
+      # Apply debiased Welch's method pipeline.\
+      dwelch_df <- compute_psd_df(psd_dwelch$ff, psd_dwelch$dwelch) %>%\
+        add_metadata()\
+      \
+      # Return list of standard Welch (and debiased Welch if enabled) \
+      # per-chunk dataframes.\
+      return(\
+        list(\
+          pwelch = pwelch_df,\
+          dwelch = dwelch_df\
+        )\
+      )\
+    \}\
+    # If debiased Welch disabled, return standard Welch per-chunk dataframes \
+    # only.\
+    else \{\
+      return(list(pwelch = pwelch_df))\
+    \}\
+  \})\
+  \
+  # Aggregate standard Welch per-chunk dataframes into a full standard Welch \
+  # dataset.\
+  pwelch <- bind_rows(lapply(psd_by_chunk, function(x) x[["pwelch"]]))\
+  \
+  # Aggregate debiased Welch per-chunk dataframes into a full standard Welch \
+  # dataset.\
+  if (dwelch_toggle) \{\
+    dwelch <- bind_rows(lapply(psd_by_chunk, function(x) x[["dwelch"]]))\
+    return(list(pwelch = pwelch, dwelch = dwelch))\
+  \}\
+  \
+  else \{\
+    return(list(pwelch = pwelch))\
+  \}\
+  \
+\}\
+\
+# Initialize Welch's method datasets.\
+welch <- welch_method(xi_data, dwelch_toggle = FALSE)\
+\
+# Save standard Welch dataset.\
+standard_welch <- welch$pwelch\
+\
+# Save debiased Welch dataset.\
+if ("dwelch" %in% names(welch)) \{\
+  debiased_welch <- welch$dwelch %>%\
+    dplyr::filter(Frequency.Dependent.PSD.Displacement..m.2.Hz. > 0)\
+\}\
+\
+\
+## `aggregate_by_chunk` aggregates the data by chunk for metadata analysis.\
+\
+aggregate_by_chunk <- function(dataset) \{\
+  # Consider a spectral dataframe.\
+  dataset %>%\
+    # Group by chunk.\
+    group_by(Date, Hour) %>%\
+    # Aggregate as follows: average PSD; the rest are constant, so take the mean.\
+    summarise(\
+      PSD.Displacement..m.2.Hz. = mean(PSD.Displacement..m.2.Hz., na.rm = TRUE),\
+      Frequency.Dependent.PSD.Displacement..m.2.Hz. = \
+        mean(Frequency.Dependent.PSD.Displacement..m.2.Hz., na.rm = TRUE),\
+      Wind.speed = mean(Wind.speed), # sd = 0\
+      Wind.direction.radians = mean(Wind.direction.radians), # sd = 0\
+      Wind.direction.degrees = mean(Wind.direction.degrees),\
+      Operational = mean(Operational)\
+    ) %>%\
+    ungroup()\
+\}\
+\
+# Aggregate Xi frequency-domain data by chunk.\
+xi_welch_chunks <- aggregate_by_chunk(xi_welch)\
+\
+# Aggregate standard Welch by chunk.\
+standard_welch_chunks <- aggregate_by_chunk(standard_welch)\
+\
+# Aggregate debiased Welch by chunk.\
+if (exists("debiased_welch")) debiased_welch_chunks <- \
+  aggregate_by_chunk(debiased_welch)\
+\
+\
+## `compare_welch` initializes Frequency vs. EKA-Adjusted log-PSD plots to \
+## compare datasets (e.g. standard Welch and debiased Welch against Xi Welch) f\
+## or a given operational status. (Figures 1 and 2).\
+\
+compare_welch <- function(dataset1, dataset2, dataset3 = NULL, status) \{\
+  # Get dataset 1's name.\
+  dataset1_name <- deparse(substitute(dataset1))\
+  # Get dataset 2's name.\
+  dataset2_name <- deparse(substitute(dataset2))\
+  # Get dataset 3's name.\
+  dataset3_name <- if (!is.null(dataset3)) deparse(substitute(dataset3)) else NULL\
+  \
+  # Subset by given operational status.\
+  subset1 <- subset(dataset1, Operational == status)\
+  subset2 <- subset(dataset2, Operational == status)\
+  \
+  # Find mean PSD at each frequency and convert to decibels. \
+  dB1 <- aggregate(10 * log10(subset1$Frequency.Dependent.PSD.Displacement..m.2.Hz.),\
+                   by = list(Frequency = subset1$Frequency..Hz.),\
+                   FUN = mean, na.rm = TRUE)\
+  dB2 <- aggregate(10 * log10(subset2$Frequency.Dependent.PSD.Displacement..m.2.Hz.),\
+                   by = list(Frequency = subset2$Frequency..Hz.),\
+                   FUN = mean, na.rm = TRUE)\
+  \
+  # Subset by given operational status, find mean PSD, and convert to decibels.\
+  if (!is.null(dataset3)) \{\
+    subset3 <- subset(dataset3, Operational == status)\
+    dB3 <- aggregate(10 * log10(subset3$Frequency.Dependent.PSD.Displacement..m.2.Hz.),\
+                     by = list(Frequency = subset3$Frequency..Hz.),\
+                     FUN = mean, na.rm = TRUE)\
+  \}\
+  \
+  # Find consistent y-range.\
+  y_range <- range(c(dB1$x, dB2$x, if (!is.null(dataset3)) dB3$x), na.rm = TRUE)\
+  \
+  # Plot dataset 1 curve.\
+  plot(dB1$Frequency, dB1$x,\
+       type = "l",\
+       col = "red",\
+       lwd = 2,\
+       xlab = "Frequency (Hz)",\
+       ylab = "EKA-weighted PSD (dB)",\
+       main = paste("EKA-weighted PSD Spectra, Operational =", status),\
+       ylim = y_range)\
+  \
+  # Overlay dataset 2 curve.\
+  lines(dB2$Frequency, dB2$x, col = "blue", lwd = 2)\
+  \
+  # Overlay dataset 3 curve.\
+  if (!is.null(dataset3)) \{\
+    lines(dB3$Frequency, dB3$x, col = "green", lwd = 2)\
+  \}\
+  \
+  # Initialize legend.\
+  legend_labels <- c(dataset1_name, dataset2_name)\
+  legend_colors <- c("red", "blue")\
+  if (!is.null(dataset3)) \{\
+    legend_labels <- c(legend_labels, dataset3_name)\
+    legend_colors <- c(legend_colors, "green")\
+  \}\
+  \
+  legend("topright", legend = legend_labels, col = legend_colors, lwd = 2, \
+         bty = "n")\
+\}\
+\
+# Generate `compare_welch` plot for background.\
+if (exists("debiased_welch")) compare_welch(xi_welch, standard_welch, \
+                                            debiased_welch, \
+                                            status = 0) else compare_welch(\
+                                              xi_welch, standard_welch, status = 0)\
+\
+# Generate `compare_welch` plot for operational.\
+if (exists("debiased_welch")) compare_welch(xi_welch, standard_welch, \
+                                            debiased_welch, \
+                                            status = 1) else compare_welch(\
+                                              xi_welch, standard_welch, status = 1)\
+\
+\
+#### EXPLORATORY DATA ANALYSIS\
+\
+## In this section, I produce plots to analyze the various features. I begin with\
+## Spectral Data Analysis, analyzing how features vary across the frequency spectrum.\
+## Then, I move to Univariate Data Analysis, analyzing features' own distributions,\
+## and lastly, I move to Bivariate Data Analysis, analyzing features' relationships\
+## with each other.\
+\
+### SPECTRAL DATA ANALYSIS\
+\
+## `plot_wind_speed_by_frequency` divides the frequency range into 8 Hz-width \
+## (or customizable-width) bands, and for each one plots EKA-adjusted log-PSD at \
+## 5 wind bands between 11.5 and 12.5 meters per second (the range of wind speech \
+## in all datasets).\
+\
+plot_wind_speed_by_frequency <- function(dataset, band_width = 8) \{\
+  # Define the frequency bins.\
+  freq_min <- 0\
+  freq_max <- 50\
+  bands <- seq(freq_min, freq_max, by = band_width)\
+  if (tail(bands, 1) < freq_max) \{\
+    bands <- c(bands, freq_max)\
+  \}\
+  \
+  # Define the wind speed bins.\
+  wind_bins <- cut(\
+    dataset$Wind.speed,\
+    breaks = seq(11.5, 12.5, by = 0.2),\
+    include.lowest = TRUE,\
+    right = FALSE\
+  )\
+  \
+  # Assign colors to each wind speed bin for plotting.\
+  colors <- rainbow(length(levels(wind_bins)))\
+  \
+  # Set up a 2x2 plot grid (so 2 pages will cover all plots if band_width = 8).\
+  par(mfrow = c(2, 2), mar = c(4, 4, 3, 1))\
+  \
+  # For each band:\
+  for (i in 1:(length(bands) - 1)) \{\
+    # Extract band limits.\
+    freq_low <- bands[i]\
+    freq_high <- bands[i + 1]\
+    \
+    # Subset dataset to current band.\
+    sub_data <- subset(dataset, Frequency..Hz. >= freq_low & Frequency..Hz. < \
+                         freq_high)\
+    \
+    # Initialize plot.\
+    plot(NULL,\
+         xlim = c(freq_low, freq_high),\
+         ylim = range(10 * log10(sub_data$Frequency.Dependent.PSD.Displacement..m.2.Hz.), \
+                      na.rm = TRUE),\
+         xlab = "Frequency (Hz)",\
+         ylab = "EKA-adjusted PSD (dB)",\
+         main = paste0("EKA-adjusted PSD by Wind Speed: ", freq_low, "\'96", \
+                       freq_high, " Hz"))\
+    \
+    # Add lines for each wind speed bin.\
+    for (j in seq_along(levels(wind_bins))) \{\
+      # Extract current band.\
+      bin_label <- levels(wind_bins)[j]\
+      \
+      # Subset dataset to current band.\
+      bin_data <- sub_data[wind_bins == bin_label, ]\
+      \
+      # Convert to decibels and plot.\
+      if (nrow(bin_data) > 0) \{\
+        agg <- aggregate(10 * log10(bin_data$Frequency.Dependent.PSD.Displacement..m.2.Hz.),\
+                         by = list(Frequency = bin_data$Frequency..Hz.),\
+                         FUN = mean, na.rm = TRUE)\
+        lines(agg$Frequency, agg$x, col = colors[j], lwd = 2)\
+      \}\
+    \}\
+    \
+    # Initialize legend in first plot.\
+    if (i == 1) \{\
+      legend("topright",\
+             legend = levels(wind_bins),\
+             col = colors,\
+             lwd = 2,\
+             title = "Wind Speed (m/s)",\
+             cex = 0.75,\
+             bty = "n")\
+    \}\
+  \}\
+\}\
+\
+plot_wind_speed_by_frequency(standard_welch)\
+\
+## `plot_wind_direction_by_frequency` divides wind direction into 30 degree bins, \
+## and plots the EKA-adjusted log-PSD for each bin.\
+\
+plot_wind_direction_by_frequency <- function(dataset, bin_width = 30) \{\
+  # Initialize the directional bins.\
+  breaks <- seq(0, 360, by = bin_width)\
+  # Divide the dataset into directional bins.\
+  dataset$direction <- cut(dataset$Wind.direction.degrees, breaks = breaks, \
+                           include.lowest = TRUE, right = FALSE)\
+  \
+  # Aggregate EKA-adjusted PSD by frequency and direction.\
+  dB <- aggregate(10 * log10(dataset$Frequency.Dependent.PSD.Displacement..m.2.Hz.),\
+                  by = list(frequency = dataset$Frequency..Hz., \
+                            direction = dataset$direction),\
+                  FUN = mean, na.rm = TRUE)\
+  \
+  # Initialize plots.\
+  bins <- unique(dB$direction)\
+  bin_count <- length(bins)\
+  row_count <- ceiling(sqrt(bin_count))\
+  column_count <- ceiling(bin_count / row_count)\
+  par(mfrow = c(row_count, column_count), mar = c(4, 4, 3, 1))\
+  \
+  # Loop through the bins; plot each.\
+  for (b in bins) \{\
+    sub <- dB[dB$direction == b, ]\
+    plot(sub$frequency, sub$x, type = "l", col = "darkblue", lwd = 2,\
+         xlab = "Frequency (Hz)", ylab = "EKA-adjusted PSD (dB)",\
+         main = paste0("Wind Direction: ", b," deg"))\
+  \}\
+  par(mfrow = c(1, 1))\
+\}\
+\
+plot_wind_direction_by_frequency(standard_welch)\
+\
+\
+## `plot_operational_by_frequency` constructs a plot of EKA-adjusted log-PSD \
+##  with two curves: a blue background curve and a red operational curve. \
+\
+plot_operational_by_frequency <- function(dataset) \{\
+  # Extract dataset name.\
+  dataset_name <- deparse(substitute(dataset))\
+  \
+  # Subset by operational status.\
+  background <- subset(dataset, Operational == 0)\
+  operational  <- subset(dataset, Operational == 1)\
+  \
+  # Aggregate mean EKA-weighted PSD by frequency.\
+  dB_off <- aggregate(10 * log10(background$Frequency.Dependent.PSD.Displacement..m.2.Hz.),\
+                      by = list(Frequency = background$Frequency..Hz.),\
+                      FUN = mean, na.rm = TRUE)\
+  \
+  dB_on <- aggregate(10 * log10(operational$Frequency.Dependent.PSD.Displacement..m.2.Hz.),\
+                     by = list(Frequency = operational$Frequency..Hz.),\
+                     FUN = mean, na.rm = TRUE)\
+  \
+  # Set y-axis range.\
+  y_range <- range(c(dB_off$x, dB_on$x), na.rm = TRUE)\
+  \
+  # Plot background curve.\
+  plot(dB_off$Frequency, dB_off$x,\
+       type = "l",\
+       col = "blue",\
+       lwd = 2,\
+       xlab = "Frequency (Hz)",\
+       ylab = "EKA-adjusted PSD (dB)",\
+       main = paste("EKA-adjusted PSD by Frequency -", dataset_name),\
+       ylim = y_range)\
+  \
+  # Overlay operational curve.\
+  lines(dB_on$Frequency, dB_on$x,\
+        col = "red",\
+        lwd = 2)\
+  \
+  # Initialize legeNd.\
+  legend("topright",\
+         legend = c("Operational = 0", "Operational = 1"),\
+         col = c("blue", "red"),\
+         lwd = 2,\
+         bty = "n")\
+\}\
+\
+plot_operational_by_frequency(standard_welch)\
+plot_operational_by_frequency(xi_welch)\
+if (exists("debiased_welch")) plot_operational_by_frequency(debiased_welch)\
+\
+### UNIVARIATE DATA ANALYSIS\
+\
+## `histogram_PSDs` generates normalized histograms and density curves\
+## of EKA-adjusted PSDs (in dB), grouped by operational status.\
+\
+histogram_PSDs <- function(dataset) \{\
+  # Extract dataset name for plot title.\
+  dataset_name <- deparse(substitute(dataset))\
+  \
+  # Subset and convert PSDs to decibels.\
+  psd_off <- 10 * log10(dataset$Frequency.Dependent.PSD.Displacement..m.2.Hz.[dataset$Operational == 0])\
+  psd_on  <- 10 * log10(dataset$Frequency.Dependent.PSD.Displacement..m.2.Hz.[dataset$Operational == 1])\
+  \
+  # Define common histogram breaks based on combined data.\
+  all_psd <- c(psd_off, psd_on)\
+  breaks <- hist(all_psd, plot = FALSE, breaks = 100)$breaks\
+  \
+  # Compute normalized histograms for consistent vertical axis.\
+  hist_off <- hist(psd_off, breaks = breaks, plot = FALSE)\
+  hist_on  <- hist(psd_on,  breaks = breaks, plot = FALSE)\
+  ymax <- max(hist_off$density, hist_on$density)\
+  \
+  # Plot histogram for operational = 0.\
+  hist(psd_off,\
+       breaks = breaks,\
+       freq = FALSE,\
+       col = rgb(0.2, 0.4, 0.8, 0.5),\
+       border = "blue",\
+       xlab = "EKA-adjusted PSD (dB)",\
+       main = paste("FDWF PSD Histogram (", dataset_name, ")"),\
+       xlim = range(breaks),\
+       ylim = c(0, ymax))\
+  \
+  # Overlay histogram for operational = 1.\
+  hist(psd_on,\
+       breaks = breaks,\
+       freq = FALSE,\
+       col = rgb(1, 0, 0, 0.4),\
+       border = "red",\
+       add = TRUE)\
+  \
+  # Overlay smoothed density estimates.\
+  lines(density(psd_off), col = "blue", lwd = 2)\
+  lines(density(psd_on),  col = "red", lwd = 2)\
+  \
+  # Add legend to clarify operational status.\
+  legend("topright",\
+         legend = c("Operational = 0", "Operational = 1"),\
+         fill = c(rgb(0.2, 0.4, 0.8, 0.5), rgb(1, 0, 0, 0.4)),\
+         border = c("blue", "red"),\
+         lty = c(1, 1),\
+         col = c("blue", "red"),\
+         bty = "n")\
+\}\
+\
+\
+# Plot given frequencies.\
+histogram_PSDs(xi_welch)\
+# Plot standard Welch frequencies by chunk.\
+histogram_PSDs(standard_welch_chunks)\
+# Plot debiased Welch frequencies by chunk.\
+if (exists("debiased_welch_chunks")) histogram_PSDs(debiased_welch_chunks)\
+# Plot given frequencies by chunk.\
+histogram_PSDs(xi_welch_chunks)\
+\
+\
+# `histogram_wind_speed` generates a histogram of wind speed, colored by \
+## operational status.\
+histogram_wind_speed <- function(dataset) \{\
+  # Extract dataset name for title.\
+  dataset_name <- deparse(substitute(dataset))\
+  \
+  # Subset wind speeds by operational status.\
+  wind_off <- dataset$Wind.speed[dataset$Operational == 0]\
+  wind_on  <- dataset$Wind.speed[dataset$Operational == 1]\
+  \
+  # Determine common bin breaks for consistent comparisons.\
+  all_wind <- c(wind_off, wind_on)\
+  breaks <- hist(all_wind, plot = FALSE, breaks = 40)$breaks\
+  \
+  # Compute histograms (non-normalized) for axis scaling.\
+  hist_off <- hist(wind_off, breaks = breaks, plot = FALSE)\
+  hist_on  <- hist(wind_on,  breaks = breaks, plot = FALSE)\
+  ymax <- max(hist_off$density, hist_on$density)\
+  \
+  # Plot normalized histograms by operational status.\
+  hist(wind_off,\
+       breaks = breaks,\
+       freq = FALSE,  # Normalize to density\
+       col = rgb(0.2, 0.4, 0.8, 0.5),\
+       main = paste("Histogram of Wind Speed (", dataset_name, ")"),\
+       xlab = "Wind Speed (m/s)",\
+       xlim = range(breaks),\
+       ylim = c(0, ymax),\
+       border = "blue")\
+  \
+  hist(wind_on,\
+       breaks = breaks,\
+       freq = FALSE,\
+       col = rgb(1, 0, 0, 0.4),\
+       add = TRUE,\
+       border = "red")\
+  \
+  # Add density curves. \
+  dens_off <- density(wind_off)\
+  dens_on  <- density(wind_on)\
+  \
+  lines(dens_off$x, dens_off$y, col = "blue", lwd = 2)\
+  lines(dens_on$x, dens_on$y, col = "red", lwd = 2)\
+  \
+  # Add legend.\
+  legend("topright",\
+         legend = c("Operational = 0", "Operational = 1"),\
+         fill = c(rgb(0.2, 0.4, 0.8, 0.5), rgb(1, 0, 0, 0.4)),\
+         border = c("blue", "red"),\
+         lty = 1,\
+         col = c("blue", "red"),\
+         bty = "n")\
+\}\
+\
+histogram_wind_speed(standard_welch_chunks)\
+histogram_wind_speed(xi_welch_chunks)\
+\
+\
+# `histogram_wind_direction` generates a histogram of wind direction, \
+## colored by operational status.\
+\
+# Initialize wind direction histogram plotter (with normalized densities).\
+histogram_wind_direction <- function(dataset) \{\
+  # Extract dataset name for title.\
+  dataset_name <- deparse(substitute(dataset))\
+  \
+  # Subset wind directions by operational status.\
+  wind_off <- dataset$Wind.direction.degrees[dataset$Operational == 0]\
+  wind_on  <- dataset$Wind.direction.degrees[dataset$Operational == 1]\
+  \
+  # Determine common bin breaks for consistent comparisons.\
+  all_wind <- c(wind_off, wind_on)\
+  breaks <- hist(all_wind, plot = FALSE, breaks = 40)$breaks\
+  \
+  # Compute histograms (non-normalized) for axis scaling.\
+  hist_off <- hist(wind_off, breaks = breaks, plot = FALSE)\
+  hist_on  <- hist(wind_on,  breaks = breaks, plot = FALSE)\
+  ymax <- max(hist_off$density, hist_on$density)\
+  \
+  # Plot normalized histogram for non-operational periods.\
+  hist(wind_off,\
+       breaks = breaks,\
+       freq = FALSE,  # Normalize to density\
+       col = rgb(0.2, 0.4, 0.8, 0.5),\
+       main = paste("Histogram of Wind Direction (", dataset_name, ")"),\
+       xlab = "Wind Direction (degrees from North)",\
+       xlim = range(breaks),\
+       ylim = c(0, ymax),\
+       border = "blue")\
+  \
+  # Overlay normalized histogram for operational periods.\
+  hist(wind_on,\
+       breaks = breaks,\
+       freq = FALSE,\
+       col = rgb(1, 0, 0, 0.4),\
+       add = TRUE,\
+       border = "red")\
+  \
+  # Add kernel density estimates.\
+  dens_off <- density(wind_off)\
+  dens_on  <- density(wind_on)\
+  \
+  lines(dens_off$x, dens_off$y, col = "blue", lwd = 2)\
+  lines(dens_on$x, dens_on$y, col = "red", lwd = 2)\
+  \
+  # Add legend.\
+  legend("topright",\
+         legend = c("Operational = 0", "Operational = 1"),\
+         fill = c(rgb(0.2, 0.4, 0.8, 0.5), rgb(1, 0, 0, 0.4)),\
+         border = c("blue", "red"),\
+         lty = 1,\
+         col = c("blue", "red"),\
+         bty = "n")\
+\}\
+\
+\
+histogram_wind_direction(standard_welch_chunks)\
+histogram_wind_direction(xi_welch_chunks)\
+\
+\
+# `histogram_date` generates a histogram of date, colored by operational status.\
+\
+# Initialize date histogram plotter (with normalized densities).\
+histogram_date <- function(dataset) \{\
+  # Extract dataset name for title.\
+  dataset_name <- deparse(substitute(dataset))\
+  \
+  # Convert to Date and numeric format for plotting.\
+  date <- as.Date(dataset$Date)\
+  date_num <- as.numeric(date)\
+  \
+  # Subset by operational status.\
+  date_off <- date_num[dataset$Operational == 0]\
+  date_on  <- date_num[dataset$Operational == 1]\
+  \
+  # Create custom breaks at weekly intervals.\
+  # Create custom breaks at weekly intervals and expand to include all data.\
+  date_seq <- seq(min(date), max(date) + 7, by = "week")\
+  breaks <- as.numeric(date_seq)\
+  \
+  \
+  # Compute histograms for density scaling.\
+  hist_off <- hist(date_off, breaks = breaks, plot = FALSE)\
+  hist_on  <- hist(date_on,  breaks = breaks, plot = FALSE)\
+  ymax <- max(hist_off$density, hist_on$density)\
+  \
+  # Plot background histogram (normalized).\
+  hist(date_off,\
+       breaks = breaks,\
+       freq = FALSE,\
+       col = rgb(0.2, 0.4, 0.8, 0.5),\
+       main = paste("Histogram of Date (", dataset_name, ")"),\
+       xlab = "Date",\
+       xlim = range(breaks),\
+       ylim = c(0, ymax),\
+       axes = FALSE,\
+       border = "blue")\
+  \
+  # Overlay operational histogram.\
+  hist(date_on,\
+       breaks = breaks,\
+       freq = FALSE,\
+       col = rgb(1, 0, 0, 0.4),\
+       add = TRUE,\
+       border = "red")\
+  \
+  # Add density curves.\
+  dens_off <- density(date_off)\
+  dens_on  <- density(date_on)\
+  lines(dens_off$x, dens_off$y, col = "blue", lwd = 2)\
+  lines(dens_on$x, dens_on$y, col = "red", lwd = 2)\
+  \
+  # Customize axis with formatted dates.\
+  axis(2)  # y-axis\
+  axis.Date(1,\
+            at = date_seq,\
+            format = "%d",\
+            las = 2)\
+  \
+  # Overlay month labels at month breaks.\
+  month_starts <- seq(min(date), max(date), by = "month")\
+  axis(1, at = as.numeric(month_starts), labels = format(month_starts, "%b"), \
+       line = 1.2, tick = FALSE, cex.axis = 0.8)\
+  \
+  # Overlay year labels at year breaks.\
+  year_starts <- seq(min(date), max(date), by = "year")\
+  axis(1, at = as.numeric(year_starts), labels = format(year_starts, "%Y"), \
+       line = 2.5, tick = FALSE, cex.axis = 0.75)\
+  \
+  # Add legend.\
+  legend("topright",\
+         legend = c("Operational = 0", "Operational = 1"),\
+         fill = c(rgb(0.2, 0.4, 0.8, 0.5), rgb(1, 0, 0, 0.4)),\
+         border = c("blue", "red"),\
+         lty = 1,\
+         col = c("blue", "red"),\
+         bty = "n")\
+\}\
+\
+histogram_date(standard_welch_chunks)\
+histogram_date(xi_welch_chunks)\
+\
+\
+# `histogram_hour` generates a histogram of hour, colored by operational status.\
+\
+# Initialize hour histogram plotter (with normalized densities).\
+histogram_hour <- function(dataset) \{\
+  # Extract dataset name for title.\
+  dataset_name <- deparse(substitute(dataset))\
+  \
+  # Ensure Hour is numeric.\
+  hour <- as.numeric(dataset$Hour)\
+  \
+  # Subset by operational status.\
+  hour_off <- hour[dataset$Operational == 0]\
+  hour_on  <- hour[dataset$Operational == 1]\
+  \
+  # Determine common breaks (e.g. every 100).\
+  breaks <- seq(0, 2400, by = 100)\
+  \
+  # Compute histograms.\
+  hist_off <- hist(hour_off, breaks = breaks, plot = FALSE)\
+  hist_on  <- hist(hour_on,  breaks = breaks, plot = FALSE)\
+  ymax <- max(hist_off$density, hist_on$density)\
+  \
+  # Plot background histogram.\
+  hist(hour_off,\
+       breaks = breaks,\
+       freq = FALSE,\
+       col = rgb(0.2, 0.4, 0.8, 0.5),\
+       main = paste("Histogram of Hour (", dataset_name, ")"),\
+       xlab = "Hour (HHMM)",\
+       xlim = range(breaks),\
+       ylim = c(0, ymax),\
+       border = "blue")\
+  \
+  # Overlay operational histogram.\
+  hist(hour_on,\
+       breaks = breaks,\
+       freq = FALSE,\
+       col = rgb(1, 0, 0, 0.4),\
+       add = TRUE,\
+       border = "red")\
+  \
+  # Add density curves.\
+  dens_off <- density(hour_off)\
+  dens_on  <- density(hour_on)\
+  lines(dens_off$x, dens_off$y, col = "blue", lwd = 2)\
+  lines(dens_on$x, dens_on$y, col = "red", lwd = 2)\
+  \
+  # Add legend.\
+  legend("topright",\
+         legend = c("Operational = 0", "Operational = 1"),\
+         fill = c(rgb(0.2, 0.4, 0.8, 0.5), rgb(1, 0, 0, 0.4)),\
+         border = c("blue", "red"),\
+         lty = 1,\
+         col = c("blue", "red"),\
+         bty = "n")\
+\}\
+\
+histogram_hour(standard_welch_chunks)\
+histogram_hour(xi_welch_chunks)\
+\
+\
+# `bar_operational` generates a bar chart of operational status, showcasing \
+## the distribution without a dataset.\
+\
+# Initialize operational status bar chart plotter.\
+bar_operational <- function(dataset) \{\
+  # Get dataset name.\
+  dataset_name <- deparse(substitute(dataset))\
+  \
+  # Count number of observations by Operational status.\
+  counts <- table(dataset$Operational)\
+  \
+  # Create bar plot.\
+  barplot(counts,\
+          names.arg = c("Off (0)", "On (1)"),\
+          col = c("blue", "red"),\
+          main = paste("Operational Status Count (", dataset_name, ")"),\
+          ylab = "Number of Observations",\
+          border = "black")\
+\}\
+\
+bar_operational(standard_welch_chunks)\
+bar_operational(xi_welch_chunks)\
+\
+### BIVARIATE DATA ANALYSIS\
+\
+# `plot_psd_by_wind_speed` generates a scatterplot of EKA-adjusted PSD by wind \
+## speed.\
+plot_psd_by_wind_speed <- function(dataset) \{\
+  # Get dataset name.\
+  dataset_name <- deparse(substitute(dataset))\
+  \
+  # Initialize plot.\
+  plot(\
+    x = dataset$Wind.speed,\
+    y = 10 * log10(dataset$Frequency.Dependent.PSD.Displacement..m.2.Hz.),\
+    col = ifelse(dataset$Operational == 1, "red", "blue"),\
+    pch = 16,\
+    xlab = "Wind Speed (m/s)",\
+    ylab = "EKA-adjusted PSD (dB)",\
+    main = paste("EKA-adjusted PSD vs. Wind Speed,",dataset_name) \
+  )\
+  \
+  # Initialize legend.\
+  legend("topleft", legend = c("Off", "On"), col = c("blue", "red"), pch = 16, \
+         bty = "n")\
+\}\
+\
+if (exists("debiased_welch_chunks")) plot_psd_by_wind_speed(debiased_welch_chunks)\
+plot_psd_by_wind_speed(standard_welch_chunks)\
+plot_psd_by_wind_speed(xi_welch_chunks)\
+\
+\
+# `plot_psd_by_hour` generates a scatterplot of EKA-adjusted PSD by hour of day.\
+plot_psd_by_hour <- function(dataset) \{\
+  # Get dataset name.\
+  dataset_name <- deparse(substitute(dataset))\
+  \
+  # Initialize plot.\
+  plot(\
+    x = dataset$Hour,\
+    y = 10 * log10(dataset$Frequency.Dependent.PSD.Displacement..m.2.Hz.),\
+    col = ifelse(dataset$Operational == 1, "red", "blue"),\
+    pch = 16,\
+    xlab = "Hour",\
+    ylab = "EKA-adjusted PSD (dB)",\
+    main = paste("EKA-adjusted PSD vs. Hour,",dataset_name) \
+  )\
+  \
+  # Initialize legend.\
+  legend("topleft", legend = c("Off", "On"), col = c("blue", "red"), pch = 16, \
+         bty = "n")\
+\}\
+\
+if (exists("debiased_welch_chunks")) plot_psd_by_hour(debiased_welch_chunks)\
+plot_psd_by_hour(standard_welch_chunks)\
+plot_psd_by_hour(xi_welch_chunks)\
+\
+\
+# `plot_psd_by_date` generates a scatterplot of EKA-adjusted PSD by date.\
+plot_psd_by_date <- function(dataset) \{\
+  # Get dataset name.\
+  dataset_name <- deparse(substitute(dataset))\
+  \
+  # Subset by operational status (since Date confounds).\
+  background <- subset(dataset, Operational == 0)\
+  operational <- subset(dataset, Operational == 1)\
+  \
+  # Initialize background plot.\
+  plot(\
+    x = as.numeric(as.Date(background$Date)) - 18262, # Days since 2020.\
+    y = 10 * log10(background$Frequency.Dependent.PSD.Displacement..m.2.Hz.),\
+    col = "blue",\
+    pch = 16,\
+    xlab = "Date (Days since 1-1-2020)",\
+    ylab = "EKA-adjusted PSD (dB)",\
+    main = paste("EKA-adjusted PSD vs. Date (Background),",dataset_name)\
+  )\
+  \
+  # Initialize legend.\
+  legend("topleft", legend = c("Off", "On"), col = c("blue", "red"), pch = 16, \
+         bty = "n")\
+  \
+  # Initialize operational plot.\
+  plot(\
+    x = as.numeric(as.Date(operational$Date)) - 18262, # Days since 2020.\
+    y = 10 * log10(operational$Frequency.Dependent.PSD.Displacement..m.2.Hz.),\
+    col = "red",\
+    pch = 16,\
+    xlab = "Date (Days since 1-1-2020)",\
+    ylab = "EKA-adjusted PSD (dB)",\
+    main = paste("EKA-adjusted PSD vs. Date (Operational),",dataset_name)\
+  )\
+\}\
+\
+if (exists("debiased_welch_chunks")) plot_psd_by_date(debiased_welch_chunks)\
+plot_psd_by_date(standard_welch_chunks)\
+plot_psd_by_date(xi_welch_chunks)\
+\
+\
+# `plot_psd_by_wind_direction` generates a polar plot of EKA-adjusted PSD by \
+## wind direction. The angle represents wind direction, and the radius represents\
+## EKA-adjusted PSD relative to other data points.\
+plot_psd_by_wind_direction <- function(dataset) \{\
+  # Convert EKA-adjusted PSD to dB.\
+  dataset$dB <- 10 * log10(dataset$Frequency.Dependent.PSD.Displacement..m.2.Hz.)\
+  \
+  # Normalize dB values to be radius values.\
+  r <- (dataset$dB - min(dataset$dB, na.rm = TRUE)) /\
+    diff(range(dataset$dB, na.rm = TRUE))\
+  \
+  # Set angles (rotate so 0\'b0 is at the top).\
+  theta <- pi/2 - dataset$Wind.direction.radians\
+  \
+  # Convert to Cartesian coordinates.\
+  x <- r * cos(theta)\
+  y <- r * sin(theta)\
+  \
+  # Set colors\
+  cols <- ifelse(dataset$Operational == 1,\
+                 adjustcolor("red", alpha.f = 0.4),\
+                 adjustcolor("blue", alpha.f = 0.4))\
+  \
+  # Initialize polar coordinate grid.\
+  plot(NA, xlim = c(-1.1, 1.1), ylim = c(-1.1, 1.1), asp = 1,\
+       axes = FALSE, xlab = "", ylab = "",\
+       main = "EKA-adjusted PSD vs. Wind Direction (Polar)")\
+  \
+  # Draw concentric circles for grid.\
+  theta_grid <- seq(0, 2*pi, length.out = 500)\
+  for (rline in seq(0.2, 1, by = 0.2)) \{\
+    lines(rline * cos(theta_grid), rline * sin(theta_grid), col = "lightgray")\
+  \}\
+  \
+  # Add radial lines and angle labels.\
+  for (deg in seq(0, 330, by = 30)) \{\
+    angle <- pi/2 - deg * pi / 180\
+    lines(c(0, cos(angle)), c(0, sin(angle)), col = "lightgray")\
+    text(1.15 * cos(angle), 1.15 * sin(angle), paste0(deg, "\'b0"), cex = 0.7)\
+  \}\
+  \
+  # Plot points on polar grid.\
+  points(x, y, pch = 21, bg = cols, col = adjustcolor(cols, alpha.f = 0.6), \
+         cex = 1)\
+  \
+  # Initialize legend.\
+  legend("bottomleft",\
+         legend = c("Operational = 0", "Operational = 1"),\
+         pt.bg = c(rgb(0.2, 0.4, 0.8, 0.4), rgb(1, 0, 0, 0.4)),\
+         pch = 21,\
+         bty = "n")\
+\}\
+\
+plot_psd_by_wind_direction(standard_welch_chunks)\
+\
+# `plot_psd_by_operational` generates a boxplot of operational status by \
+## EKA-adjusted PSD.\
+plot_psd_by_operational <- function(dataset) \{\
+  # Extract dataset name.\
+  dataset_name <- deparse(substitute(dataset))\
+  # Initialize boxplot.\
+  boxplot(\
+    10 * log10(Frequency.Dependent.PSD.Displacement..m.2.Hz.) ~ Operational,\
+    data = dataset,\
+    names = c("Off", "On"),\
+    col = c("blue", "red"),\
+    ylab = "EKA-adjusted PSD (dB)",\
+    main = paste("EKA-adjusted PSD by Operational Status,",dataset_name)\
+  )\
+\}\
+\
+if (exists("debiased_welch_chunks")) plot_psd_by_operational(debiased_welch_chunks)\
+plot_psd_by_operational(standard_welch_chunks)\
+plot_psd_by_operational(xi_welch_chunks)\
+\
+# `correlation_heatmap` generates a heatmap of all covariates in the dataset.\
+correlation_heatmap <- function(dataset) \{\
+  \
+  # Convert Date to numeric.\
+  if ("Date" %in% colnames(dataset)) \{\
+    dataset$Date <- as.numeric(as.Date(dataset$Date))\
+  \}\
+  \
+  # Extract numeric columns and compute correlation matrix.\
+  numeric_data <- dataset[sapply(dataset, is.numeric)]\
+  numeric_data <- na.omit(numeric_data)\
+  cor_matrix <- cor(numeric_data)\
+  \
+  # Abbreviate column names.\
+  colnames(cor_matrix) <- abbreviate(colnames(cor_matrix), minlength = 6)\
+  rownames(cor_matrix) <- abbreviate(rownames(cor_matrix), minlength = 6)\
+  \
+  # Melt matrix into long format.\
+  cor_melted <- melt(cor_matrix)\
+  \
+  # Initialize plot.\
+  ggplot(data = cor_melted, aes(x = Var1, y = Var2, fill = value)) +\
+    geom_tile(color = "white") +\
+    geom_text(aes(label = sprintf("%.2f", value)), size = 4, color = "black") +\
+    scale_fill_gradient2(\
+      low = "blue", high = "red", mid = "white", \
+      midpoint = 0, limit = c(-1, 1), space = "Lab",\
+      name = "Correlation"\
+    ) +\
+    theme_minimal(base_size = 12) +\
+    theme(\
+      axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1),\
+      panel.grid.major = element_blank(),\
+      panel.border = element_blank()\
+    ) +\
+    labs(\
+      title = "Correlation Heatmap (Abbreviated Names)",\
+      x = "", y = ""\
+    )\
+\}\
+\
+correlation_heatmap(standard_welch_chunks)\
+\
+#### MODELS\
+\
+## In this section, I construct, analyze, perform diagnostics on, and generate\
+## plots on various models. I begin with preprocessing to initialize a sample\
+## and full data set for model tuning. I then construct Generative Additive Models\
+## before moving on to XGBoost.\
+\
+### GENERALIZED ADDITIVE MODELS\
+\
+## I initialize the `chunk_id` variable to differentiate between chunks in models\
+## (for random effects), and convert operational status to be a factor.\
+\
+# Treat xi_welch as a sample set since it's just 47 chunks.\
+sample_data <- xi_welch\
+# Treat full_data as a full dataset since it's 394 chunks.\
+full_data <- standard_welch\
+\
+# Initialize chunk ID variable as interaction of Date and Hour.\
+sample_data$chunk_id <- interaction(sample_data$Date, sample_data$Hour, \
+                                    drop = TRUE)\
+# Treat operational status as a factor.\
+sample_data$Operational <- as.factor(sample_data$Operational)\
+\
+# Initialize chunk ID variable as interaction of Date and Hour.\
+full_data$chunk_id <- interaction(full_data$Date, full_data$Hour, drop = TRUE)\
+# Treat operational status as a factor.\
+full_data$Operational <- as.factor(full_data$Operational)\
+\
+# Initialize GAM model A.\
+gam_A <- bam(\
+  10 * log10(Frequency.Dependent.PSD.Displacement..m.2.Hz.) ~\
+    s(Frequency..Hz., k = 20) +\
+    s(Frequency..Hz., by = Operational, k = 20) +\
+    s(Wind.direction.radians, bs = "cc") +\
+    s(chunk_id, bs = "re"),  # Chunk-level random intercept\
+  data = full_data,\
+  method = "fREML",\
+  discrete = TRUE,\
+  nthreads = detectCores() - 1\
+)\
+\
+# Assess GAM model A.\
+summary(gam_A)\
+AIC(gam_A)\
+\
+# Perform diagnostics on GAM model A.\
+# gam.check(gam_A)\
+\
+# Initialize GAM model B.\
+gam_B <- bam(\
+  10 * log10(Frequency.Dependent.PSD.Displacement..m.2.Hz.) ~\
+    s(Frequency..Hz., k = 20) +\
+    ti(Frequency..Hz., by = Operational) + # Key Term. Operational == 1\
+    te(Frequency..Hz., Wind.direction.radians) +\
+    s(chunk_id, bs = "re"),\
+  data = full_data,\
+  method = "fREML",\
+  discrete = TRUE,\
+  nthreads = detectCores() - 1\
+)\
+\
+# Assess GAM model B.\
+summary(gam_B)\
+AIC(gam_B)\
+\
+# Perform diagnostics on GAM model B.\
+# gam.check(gam_B)\
+\
+# Initialize GAM model C, which models uplift but not over frequency.\
+gam_C <- bam(\
+  10 * log10(Frequency.Dependent.PSD.Displacement..m.2.Hz.) ~\
+    s(Frequency..Hz., k = 20) +\
+    Operational +\
+    te(Frequency..Hz., Wind.direction.radians) +\
+    s(chunk_id, bs = "re"),\
+  data = full_data,\
+  method = "fREML",\
+  discrete = TRUE,\
+  nthreads = detectCores() - 1\
+)\
+\
+# Assess GAM model C,\
+summary(gam_C)\
+AIC(gam_C)\
+\
+# Perform diagnostics on GAM model C.\
+# gam.check(gam_C)\
+\
+## QUANTILE GENERALIZED ADDITIVE MODELS\
+\
+# Initalize quantiles of interest.\
+quantiles <- c(0.25, 0.5, 0.75)\
+\
+# Fit qgam models across quantiles.\
+for (tau in quantiles) \{\
+  # Initialize qGAM model A.\
+  try\{\
+    qgam_A <- qgam(\
+      10 * log10(Frequency.Dependent.PSD.Displacement..m.2.Hz.) ~\
+        s(Frequency..Hz., k = 20) +\
+        s(Frequency..Hz., by = Operational, k = 20) +\
+        s(Wind.direction.radians, bs = "cc") +\
+        s(chunk_id, bs = "re"),  # Chunk-level random intercept\
+      data = full_data,\
+      qu = tau,\
+      err = 0.05,\
+      discrete = TRUE,\
+      multicore = TRUE\
+    )\
+    # Rename model by quantile.\
+    assign(paste0("qgam_A_", tau), qgam_A)\
+    \
+    # Assess model.\
+    summary(get(paste0("qgam_A_", tau)))\
+  \}\
+  \
+  # Initialize qGAM model B.\
+  try\{\
+    qgam_B <- qgam(\
+      10 * log10(Frequency.Dependent.PSD.Displacement..m.2.Hz.) ~\
+        s(Frequency..Hz., k = 20) +\
+        ti(Frequency..Hz., by = Operational) + # Key Term. Operational == 1\
+        te(Frequency..Hz., Wind.direction.radians) +\
+        s(chunk_id, bs = "re"),\
+      data = full_data,\
+      qu = tau,\
+      err = 0.05,\
+      discrete = TRUE,\
+      multicore = TRUE\
+    )\
+    # Rename model by quantile.\
+    assign(paste0("qgam_B_", tau), qgam_B)\
+    \
+    # Assess model.\
+    summary(get(paste0("qgam_B_", tau)))\
+  \}\
+  \
+  try\{\
+    # Initialize qGAM model C.\
+    qgam_C <- qgam(\
+      10 * log10(Frequency.Dependent.PSD.Displacement..m.2.Hz.) ~\
+        s(Frequency..Hz., k = 20) + \
+        Operational +\
+        te(Frequency..Hz., Wind.direction.radians) +\
+        s(chunk_id, bs = "re"),\
+      data = full_data,\
+      qu = tau,\
+      err = 0.05,\
+      discrete = TRUE,\
+      multicore = TRUE\
+    )\
+    # Rename model by quantile.\
+    assign(paste0("qgam_C_", tau), qgam_C)\
+    \
+    # Assess model.\
+    summary(get(paste0("qgam_C_", tau)))\
+  \}\
+\}\
+\
+### XGBoost\
+\
+## Preprocessing\
+\
+# Set set for randomness.\
+set.seed(123)\
+\
+# Add wind vector components and define chunk ID.\
+xgb_data <- standard_welch %>%\
+  mutate(\
+    chunk_id = interaction(Date, Hour, drop = TRUE),\
+    sine_wind = sin(Wind.direction.radians),\
+    cosine_wind = cos(Wind.direction.radians)\
+  )\
+\
+# Declare predictors and target variable.\
+xgb_features <- c("Frequency..Hz.", "sine_wind", "cosine_wind")\
+xgb_target <- "Frequency.Dependent.PSD.Displacement..m.2.Hz."\
+\
+## Train-Test Split\
+\
+# `train_test_split` splits the dataset into a test set and a training set by \
+## chunk, assigning test_frac proportion of chunks to test and 1 - test_frac to \
+## training.\
+train_test_split <- function(dataset, op_status, test_frac = 0.2, seed = 42) \{\
+  # Subset data by operational status.\
+  subset_data <- dataset %>% filter(Operational == op_status)\
+  \
+  # Set seed for reproducibility.\
+  set.seed(123)\
+  \
+  # Extract all chunk IDs.\
+  chunk_ids <- unique(subset_data$chunk_id)\
+  \
+  # Randomly sample a fraction of chunks to use as the test set.\
+  test_chunks <- sample(chunk_ids, size = round(length(chunk_ids) * test_frac))\
+  \
+  # Create a  vector indicating which rows belong to test chunks.\
+  is_test <- subset_data$chunk_id %in% test_chunks\
+  \
+  # Split the data into training and test subsets.\
+  train_data <- subset_data[!is_test, ]\
+  test_data  <- subset_data[is_test, ]\
+  \
+  # Return a list of feature matrices and log-PSD vectors.\
+  return(list(\
+    X_train = as.matrix(train_data %>% select(all_of(xgb_features))),\
+    y_train = log10(train_data[[xgb_target]]),\
+    X_test  = as.matrix(test_data %>% select(all_of(xgb_features))),\
+    y_test  = log10(test_data[[xgb_target]])\
+  ))\
+\}\
+\
+# Perform train-test split on background and operational sets.\
+xgb_data_op0 <- train_test_split(xgb_data, 0)\
+xgb_data_op1 <- train_test_split(xgb_data, 1)\
+\
+## Model Initialization\
+\
+# Initialize model paramters.\
+xgb_parameters <- list(\
+  objective = "reg:squarederror",\
+  eval_metric = "rmse",\
+  max_depth = 6,\
+  eta = 0.1,\
+  subsample = 0.8,\
+  colsample_bytree = 0.8,\
+  nthread = parallel::detectCores() - 1\
+)\
+\
+# Initialize background model.\
+xgb_model_op0 <- xgboost(data = xgb_data_op0$X_train, label = xgb_data_op0$y_train,\
+                         params = xgb_parameters, nrounds = 100, verbose = 0)\
+\
+# Initialize operational model.\
+xgb_model_op1 <- xgboost(data = xgb_data_op1$X_train, label = xgb_data_op1$y_train,\
+                         params = xgb_parameters, nrounds = 100, verbose = 0)\
+\
+## Model Diagnostics\
+\
+# Obtain model diagnostics (RMSE, MAE, R^2) for each model.\
+xgb_eval_model <- function(model, X_test, y_test) \{\
+  # Generate predictions with model.\
+  pred <- predict(model, X_test)\
+  # Get RMSE.\
+  rmse <- sqrt(mean((pred - y_test)^2))\
+  # Get MAE.\
+  mae  <- mean(abs(pred - y_test))\
+  # Get R2.\
+  rsq  <- 1 - sum((pred - y_test)^2) / sum((y_test - mean(y_test))^2)\
+  # Return vector with diagnostics.\
+  c(RMSE = rmse, MAE = mae, R2 = rsq)\
+\}\
+\
+# Print background model diagnostics. (Table 1).\
+cat("== Background Model ==\\n")\
+print(xgb_eval_model(xgb_model_op0, xgb_data_op0$X_test, xgb_data_op0$y_test))\
+\
+# Print operational model diagnostics.\
+cat("\\n== Operational Model ==\\n")\
+print(xgb_eval_model(xgb_model_op1, xgb_data_op1$X_test, xgb_data_op1$y_test))\
+\
+# Uplift Curve\
+\
+# Create a frequency sequence for prediction (0.5 to 50 Hz, evenly spaced).\
+xgb_freq_seq <- seq(0.5, 50, length.out = 500)\
+\
+# Compute the mean wind direction (radians) across the dataset.\
+# Used to simulate average conditions for uplift prediction.\
+xgb_mean_direction <- mean(xgb_data$Wind.direction.radians, na.rm = TRUE)\
+\
+# Build a synthetic grid of prediction inputs: frequency + wind vector components.\
+xgb_pred_grid <- data.frame(\
+  Frequency..Hz. = xgb_freq_seq,\
+  sine_wind = sin(xgb_mean_direction),\
+  cosine_wind = cos(xgb_mean_direction)\
+)\
+\
+# Convert to matrix format for XGBoost input.\
+xgb_X_grid <- as.matrix(xgb_pred_grid)\
+\
+# Predict PSD values under background (Operational = 0) and operational (1) \
+# conditions.\
+xgb_pred_op0 <- predict(xgb_model_op0, xgb_X_grid)\
+xgb_pred_op1 <- predict(xgb_model_op1, xgb_X_grid)\
+\
+# Compute uplift in decibels (10 \'d7 log10-ratio difference).\
+xgb_uplift_dB <- 10 * (xgb_pred_op1 - xgb_pred_op0)\
+\
+# Plot the uplift curve across frequency.\
+plot(xgb_freq_seq, xgb_uplift_dB, type = "l", lwd = 2,\
+     xlab = "Frequency (Hz)", ylab = "Turbine Uplift (dB)",\
+     main = "XGBoost Uplift Curve (Chunk-Based Split)")\
+abline(h = 0, lty = 2)  # Reference line at 0 dB uplift.\
+\
+## Predicted vs. Observed Plot (Figure 3).\
+\
+# Generate a predicted vs. observed plot for a given model.\
+plot_predicted_by_observed <- function(model, X, y, title, filename) \{\
+  # Predict on test set.\
+  preds <- predict(model, X)  \
+  # Combine into data frame.\
+  df <- data.frame(Observed = y, Predicted = preds) \
+  # Initialize plot.\
+  final_plot <- ggplot(df, aes(x = Observed, y = Predicted)) +\
+    geom_point(alpha = 0.3) +  \
+    geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "red") + \
+    theme_minimal() +\
+    labs(title = title, x = "Observed log10 PSD", y = "Predicted log10 PSD")\
+  \
+  ggsave(file.path(output_dir, filename), final_plot, width = 6, height = 5)\
+\}\
+\
+# Generate and save prediction diagnostics for both models.\
+plot_predicted_by_observed(xgb_model_op0, xgb_data_op0$X_test, xgb_data_op0$y_test,\
+                           "Observed vs. Predicted (Background)", "xgb_obs_pred_bg.png")\
+\
+plot_predicted_by_observed(xgb_model_op1, xgb_data_op1$X_test, xgb_data_op1$y_test,\
+                           "Observed vs. Predicted (Operational)", "xgb_obs_pred_op.png")\
+\
+## Feature Importance Plots (Figure 4).\
+\
+# Extract and plot feature importance for background model.\
+importance_op0 <- xgb.importance(model = xgb_model_op0)\
+png(file.path(output_dir, "xgb_importance_op0.png"), width = 700, height = 500)\
+xgb.plot.importance(importance_op0, main = "Background: Feature Importance")\
+dev.off()\
+\
+# Extract and plot feature importance for operational model.\
+importance_op1 <- xgb.importance(model = xgb_model_op1)\
+png(file.path(output_dir, "xgb_importance_op1.png"), width = 700, height = 500)\
+xgb.plot.importance(importance_op1, main = "Operational: Feature Importance")\
+dev.off()\
+\
+## Bootstrapping Confidence Intervals \
+\
+# Define uplift bootstrap function using chunk-level resampling.\
+bootstrap_uplift <- function(data, features, target, freq_seq, n_iter = 100) \{\
+  uplift_matrix <- matrix(NA, nrow = n_iter, ncol = length(freq_seq))\
+  \
+  # Set seed for reproducability.\
+  set.seed(42)\
+  \
+  for (i in 1:n_iter) \{\
+    # Sample chunk IDs with replacement.\
+    sampled_chunks <- sample(unique(data$chunk_id),\
+                             size = length(unique(data$chunk_id)),\
+                             replace = TRUE)\
+    \
+    # Create bootstrap sample by replicating entire chunks.\
+    boot_data <- map_dfr(sampled_chunks, ~ data %>% filter(chunk_id == .x))\
+    \
+    # Split by operational state.\
+    boot_op0 <- boot_data %>% filter(Operational == 0)\
+    boot_op1 <- boot_data %>% filter(Operational == 1)\
+    \
+    # Train background model.\
+    model0 <- xgboost(\
+      data = xgb.DMatrix(as.matrix(boot_op0 %>% select(all_of(features))),\
+                         label = log10(boot_op0[[target]])),\
+      params = xgb_parameters,\
+      nrounds = 100,\
+      verbose = 0\
+    )\
+    \
+    # Train operational model.\
+    model1 <- xgboost(\
+      data = xgb.DMatrix(as.matrix(boot_op1 %>% select(all_of(features))),\
+                         label = log10(boot_op1[[target]])),\
+      params = xgb_parameters,\
+      nrounds = 100,\
+      verbose = 0\
+    )\
+    \
+    # Predict uplift at mean wind direction.\
+    mean_direction <- mean(data$Wind.direction.radians, na.rm = TRUE)\
+    pred_grid <- data.frame(\
+      Frequency..Hz. = freq_seq,\
+      sine_wind = sin(mean_direction),\
+      cosine_wind = cos(mean_direction)\
+    )\
+    X_grid <- as.matrix(pred_grid)\
+    pred0 <- predict(model0, X_grid)\
+    pred1 <- predict(model1, X_grid)\
+    \
+    uplift_matrix[i, ] <- 10 * (pred1 - pred0)\
+  \}\
+  \
+  # Summarize bootstrap distributions by quantiles.\
+  data.frame(\
+    Frequency = freq_seq,\
+    Low95 = apply(uplift_matrix, 2, quantile, 0.025),\
+    Low90 = apply(uplift_matrix, 2, quantile, 0.05),\
+    Low80 = apply(uplift_matrix, 2, quantile, 0.10),\
+    Q1     = apply(uplift_matrix, 2, quantile, 0.25),\
+    Median = apply(uplift_matrix, 2, median),\
+    Q3     = apply(uplift_matrix, 2, quantile, 0.75),\
+    High80 = apply(uplift_matrix, 2, quantile, 0.90),\
+    High90 = apply(uplift_matrix, 2, quantile, 0.95),\
+    High95 = apply(uplift_matrix, 2, quantile, 0.975)\
+  )\
+\}\
+\
+# Run bootstrap procedure.\
+bootstrap_data <- bootstrap_uplift(xgb_data, xgb_features, xgb_target, xgb_freq_seq)\
+\
+# Export uplift curve with confidence ribbons. (Figure 5).\
+ggplot(bootstrap_data, aes(x = Frequency)) +\
+  geom_ribbon(aes(ymin = Low95, ymax = High95, fill = "95% CI"), alpha = 0.2) +\
+  geom_ribbon(aes(ymin = Low90, ymax = High90, fill = "90% CI"), alpha = 0.25) +\
+  geom_ribbon(aes(ymin = Low80, ymax = High80, fill = "80% CI"), alpha = 0.3) +\
+  geom_ribbon(aes(ymin = Q1, ymax = Q3, fill = "50% CI"), alpha = 0.4) +\
+  geom_line(aes(y = xgb_uplift_dB, color = "Empirical"), linewidth = 0.7) +\
+  geom_line(aes(y = Median, color = "Model"), linewidth = 1.2) +\
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray40") +\
+  scale_fill_manual(\
+    name = "Confidence Interval",\
+    values = c("95% CI" = "#3182bd", "90% CI" = "#6baed6",\
+               "80% CI" = "#9ecae1", "50% CI" = "#c6dbef")\
+  ) +\
+  scale_color_manual(\
+    name = "Curve",\
+    values = c("Empirical" = "darkorange2", "Model" = "black")\
+  ) + \
+  scale_x_continuous(\
+    breaks = seq(0, max(bootstrap_data$Frequency), by = 4),        # Major grid lines every 4, starting at 0\
+    minor_breaks = seq(0, max(bootstrap_data$Frequency), by = 2)   # Minor grid lines every 2, starting at 0\
+  ) +\
+  labs(\
+    x = "Frequency (Hz)", y = "Uplift (dB)",\
+    title = "Uplift Curve with Bootstrapped Confidence Intervals",\
+    subtitle = "Model-predicted uplift and confidence bands across frequency."\
+  ) +\
+  theme_minimal(base_size = 14) +\
+  theme(legend.position = "bottom", legend.box = "vertical")\
+\
+ggsave(file.path(output_dir, "xgb_uplift_confband_styled.png"), width = 10, \
+       height = 6)\
+\
+## Directional Sensitivity Curve\
+\
+# Define  cardinal wind directions and  corresponding angles in radians.\
+wind_direction_labels <- c("NW", "NE", "SW", "SE")\
+wind_direction_angles <- c(7*pi/4, pi/4, 5*pi/4, 3*pi/4)\
+\
+# Initialize dataframe to store model-predicted uplift per direction.\
+uplift_model_directional <- data.frame()\
+\
+# Loop through each wind direction; compute predicted uplift using trained models.\
+for (i in seq_along(wind_direction_labels)) \{\
+  direction_label <- wind_direction_labels[i]\
+  wind_angle <- wind_direction_angles[i]\
+  \
+  # Create prediction grid: frequency and wind vector components.\
+  model_input_grid <- data.frame(\
+    Frequency..Hz. = xgb_freq_seq,\
+    sine_wind = sin(wind_angle),\
+    cosine_wind = cos(wind_angle)\
+  )\
+  model_matrix <- as.matrix(model_input_grid)\
+  \
+  # Predict log10(PSD) under operational and background conditions.\
+  pred_operational <- predict(xgb_model_op1, model_matrix)\
+  pred_background  <- predict(xgb_model_op0, model_matrix)\
+  \
+  # Compute uplift in dB and store in long-format dataframe.\
+  uplift_model_directional <- rbind(uplift_model_directional, data.frame(\
+    Frequency = xgb_freq_seq,\
+    Uplift_dB = 10 * (pred_operational - pred_background),\
+    Wind_Direction = direction_label,\
+    Source = "Model"\
+  ))\
+\}\
+\
+# Empirical Uplift Curve (for Directional Sensitivity Curve)\
+\
+# Define directional ranges in radians for empirical estimation.\
+empirical_direction_ranges <- list(\
+  NW = c(5 * pi / 4, 7 * pi / 4),\
+  NE = c(pi / 4, 3 * pi / 4),\
+  SW = c(pi, 5 * pi / 4),\
+  SE = c(3 * pi / 4, pi)\
+)\
+\
+# Initialize dataframe to store empirical uplift curves.\
+uplift_empirical_directional <- data.frame()\
+\
+# Loop through each directional sector and compute empirical uplift curves.\
+for (direction_label in names(empirical_direction_ranges)) \{\
+  angle_range <- empirical_direction_ranges[[direction_label]]\
+  \
+  # Filter Welch data within angular sector.\
+  directional_subset <- standard_welch %>%\
+    filter(Wind.direction.radians >= angle_range[1],\
+           Wind.direction.radians <= angle_range[2])\
+  \
+  # Average log10(PSD) by frequency for background condition.\
+  mean_background <- directional_subset %>%\
+    filter(Operational == 0) %>%\
+    group_by(Frequency..Hz.) %>%\
+    summarise(log_psd_background = mean(log10(Frequency.Dependent.PSD.Displacement..m.2.Hz.),\
+                                        na.rm = TRUE)) %>%\
+    ungroup()\
+  \
+  # Average log10(PSD) by frequency for operational condition.\
+  mean_operational <- directional_subset %>%\
+    filter(Operational == 1) %>%\
+    group_by(Frequency..Hz.) %>%\
+    summarise(log_psd_operational = mean(log10(Frequency.Dependent.PSD.Displacement..m.2.Hz.), \
+                                         na.rm = TRUE)) %>%\
+    ungroup()\
+  \
+  # Merge, compute empirical uplift, and label direction.\
+  uplift_merged <- merge(mean_background, mean_operational, by = "Frequency..Hz.") %>%\
+    mutate(\
+      Frequency = Frequency..Hz.,\
+      Uplift_dB = 10 * (log_psd_operational - log_psd_background),\
+      Wind_Direction = direction_label,\
+      Source = "Empirical"\
+    ) %>%\
+    select(Frequency, Uplift_dB, Wind_Direction, Source)\
+  \
+  # Append to overall empirical dataframe.\
+  uplift_empirical_directional <- rbind(uplift_empirical_directional, uplift_merged)\
+\}\
+\
+# Combine model-predicted and empirical uplift curves.\
+uplift_directional_combined <- rbind(uplift_model_directional, uplift_empirical_directional)\
+\
+# Plot directional uplift: model vs. empirical. (Figure 6).\
+ggplot(uplift_directional_combined, aes(x = Frequency, y = Uplift_dB,\
+                                        color = Source, linetype = Source)) +\
+  geom_line(linewidth = 1) +\
+  geom_hline(yintercept = 0, linetype = "dotted", color = "black") +\
+  facet_wrap(~Wind_Direction, nrow = 2) +\
+  labs(\
+    title = "Uplift Curves by Wind Direction",\
+    subtitle = "Model-predicted uplift across directional quadrants by frequency",\
+    x = "Frequency (Hz)",\
+    y = "Uplift (dB)"\
+  ) +\
+  theme_minimal(base_size = 14) +\
+  theme(\
+    legend.title = element_blank(),\
+    panel.grid.minor = element_blank()\
+  )\
+\
+# Save plot to file.\
+ggsave(file.path(output_dir, "xgb_directional_comparison.png"), width = 10, \
+       height = 6)\
+\
+## Confidence Interval Table.\
+\
+# Get uplift and half-width CI table.\
+uplift_table <- bootstrap_data %>%\
+  mutate(FreqRounded = round(Frequency)) %>%\
+  filter(FreqRounded %in% 1:50) %>%\
+  group_by(FreqRounded) %>%\
+  slice_min(abs(Frequency - FreqRounded), n = 1) %>%\
+  ungroup() %>%\
+  transmute(\
+    Frequency = FreqRounded,\
+    Median = round(Median, 2),\
+    CI95_HalfWidth = round((High95 - Low95) / 2, 2),\
+    CI90_HalfWidth = round((High90 - Low90) / 2, 2),\
+    CI80_HalfWidth = round((High80 - Low80) / 2, 2),\
+    CI50_HalfWidth = round((Q3 - Q1) / 2, 2)\
+  )\
+\
+print(uplift_table)\
+\
+# Define frequencies of interest.\
+key_freqs <- c(2, 3, 4, 5, 6, 7, 8, 9, 10, 15, 20, 30, 40, 45)\
+\
+# Get confidence interval table. (Table 2).\
+confidence_table <- bootstrap_data %>%\
+  mutate(FreqRounded = round(Frequency)) %>%\
+  filter(FreqRounded %in% key_freqs) %>%\
+  group_by(FreqRounded) %>%\
+  slice_min(abs(Frequency - FreqRounded), n = 1) %>%\
+  ungroup() %>%\
+  transmute(\
+    Frequency = FreqRounded,\
+    Median = round(Median, 2),\
+    `50%` = sprintf("[%.2f, %.2f]", Q1, Q3),\
+    `80%` = sprintf("[%.2f, %.2f]", Low80, High80),\
+    `90%` = sprintf("[%.2f, %.2f]", Low90, High90),\
+    `95%` = sprintf("[%.2f, %.2f]", Low95, High95)\
+  )\
+\
+print(confidence_table)\
+\
+# Directional Table\
+\
+# Round and filter to nearest available frequency for each quadrant\
+directional_table <- uplift_model_directional %>%\
+  mutate(FreqRounded = round(Frequency)) %>%\
+  filter(FreqRounded %in% key_freqs) %>%\
+  group_by(FreqRounded, Wind_Direction) %>%\
+  slice_min(abs(Frequency - FreqRounded), n = 1) %>%\
+  ungroup() %>%\
+  select(Frequency = FreqRounded, Wind_Direction, Uplift_dB) %>%\
+  tidyr::pivot_wider(names_from = Wind_Direction, values_from = Uplift_dB) %>%\
+  arrange(Frequency) %>%\
+  mutate(across(-Frequency, ~ round(.x, 2)))\
+\
+print(directional_table)\
+}
