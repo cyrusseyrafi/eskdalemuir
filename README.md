@@ -1,2 +1,15 @@
-A 'consultancy-style dissertation' in the MSc Statistics with Data Science program at The University of Edinburgh modeling seismic noise uplift from the construction of wind turbines near the Eskalemuir Seismic Array using XGBoost.
-
+The Eskdalemuir Seismic Array (EKA) is the UK’s primary contribution to the Comprehensive Nuclear-Test-Ban Treaty (CTBT), monitoring global seismic activity in the 0.5-8 Hz range to detect underground nuclear tests. However, modern wind turbines—which are in demand across southern Scotland—also emit energy within this frequency band, raising concerns that continued wind devel- opment could interfere with the EKA’s detection capabilities.
+To mitigate this risk, the Ministry of Defence (MoD) has imposed strict planning constraints: a 10 km exclusion zone around the array and a cumulative seismic noise cap of 0.336 nanometers (nm) in displacement amplitude for all turbines within a 50 km radius.
+Initial impact assessments were based on a conservative 2014 model developed by Xi Engineering. By 2018, this model indicated that the seismic noise budget had been fully allocated, effectively halting further turbine development in the region. However, more recent field data suggest that actual turbine emissions may be lower than originally estimated, highlighting the need for a more accurate and adaptive model.
+This study addresses that need by developing a machine learning model to quantify the seismic up- lift caused by turbine operation. Using ground motion data collected before and after the construction of a wind farm in southern Scotland, it applies eXtreme Gradient Boosting (XGBoost) to predict the EKA-weighted power spectral density (PSD) of seismic displacement. Separate models are trained on background and operational periods, with their difference isolating the uplift attributable to turbine activity.
+Key findings include:
+• Frequency-specific uplift: Peaks occur at 5 Hz and 8–10 Hz—within or adjacent to the EKA’s primary band—where turbine-induced uplift reaches as high as 17 dB.
+• The environment is a significant factor: Uplift varies with wind direction, with northeast winds producing the highest increases.
+• High model performance: XGBoost achieved R2 > 0.998 and offered tight uncertainty bounds, outperforming traditional methods.
+Although results are expressed in decibels of PSD, they directly relate to the MoD’s displacement threshold: elevated PSD at key frequencies implies higher seismic energy at EKA and greater risk of breaching the amplitude cap.
+To enhance policy relevance, the following extensions are proposed:
+1. Propagation modeling to estimate uplift at the EKA itself, allowing direct comparison with the 0.336 nm limit.
+2. Multi-site training to assess generalizability across turbine types and terrains.
+3. Expanded environmental data (e.g. wind speeds, turbine logs) to enable real-time forecasting under variable conditions.
+These improvements would greatly enhance future, data-driven assessments of seismic compat- ibility—upholding the UK’s CTBT obligations while further enabling Scotland’s renewable energy goals.
+Despite limitations such as single-site data and restricted wind conditions, the present study of- fers a scalable, empirically grounded framework. It demonstrates that seismic monitoring and wind development need not be in conflict and provides a robust foundation for modernizing regulation in a way that balances international security with clean energy growth.
